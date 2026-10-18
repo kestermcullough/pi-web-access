@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Optional Linkup search provider. Set `linkupApiKey` or `LINKUP_API_KEY` and select `provider: "linkup"`. Configure `linkupDepth` as `flash`, `fast` (default), `standard`, or `deep`. Supports result limits, domain filters, recency filters, and inline text content. Linkup is excluded from the built-in `auto` chain and `all` because searches consume account credits.
+
 ## [0.42.0] - 2026-10-17
 
 ### Highlights
