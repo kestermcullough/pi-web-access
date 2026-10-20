@@ -1,15 +1,19 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import { normalizeDomain } from "./domain-filter-normalization.ts";
+import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
 import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
+import { loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl } from "./ssrf-protection.ts";
 import { fetchWithCredentialRedirects, getWebSearchConfigPath } from "./utils.ts";
 
 const DEEPSEEK_SEARCH_URL = "https://api.deepseek.com/v1/tools/search";
+const DEEPSEEK_FETCH_URL = "https://api.deepseek.com/v1/tools/fetch";
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 30_000;
+const FETCH_TIMEOUT_MS = 60_000;
 // The API rejects queries over 128 Unicode characters, operators included.
 const MAX_QUERY_CHARS = 128;
 // `summary` is documented as 600-800 characters and written for models; keep it whole.
@@ -30,6 +34,11 @@ interface DeepSeekResult {
 	url?: unknown;
 	snippet?: unknown;
 	summary?: unknown;
+	content?: unknown;
+}
+
+interface DeepSeekSearchOptions extends SearchOptions {
+	includeContent?: boolean;
 }
 
 let cachedConfig: WebSearchConfig | null = null;
@@ -106,6 +115,83 @@ function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
+// DeepSeek Fetch escapes Markdown punctuation even when the content is already Markdown.
+// Keep escapes that could change emphasis, code spans and links; unescape only the safe subset.
+function unescapeMarkdownSegment(segment: string): string {
+	return segment.replace(/\\([/.,:()&+#>|!_\-"'])/g, (match, char: string, offset: number, whole: string) => {
+		if (char === "!" && whole[offset + 2] === "[") return match;
+		return char;
+	});
+}
+
+function normalizeInlineMarkdown(line: string): string {
+	return line
+		.split(/(`+[^`]*`+)/g)
+		.map((part, index) => (index % 2 === 0 ? unescapeMarkdownSegment(part) : part))
+		.join("");
+}
+
+function normalizeDeepSeekMarkdown(markdown: string): string {
+	let fence: { char: string; length: number } | null = null;
+	return markdown
+		.split("\n")
+		.map((line) => {
+			const match = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+			if (match) {
+				const marker = match[1]!;
+				if (fence === null) {
+					fence = { char: marker[0]!, length: marker.length };
+				} else if (
+					marker[0] === fence.char &&
+					marker.length >= fence.length &&
+					line.slice(match[0].length).trim() === ""
+				) {
+					fence = null;
+				}
+				return line;
+			}
+			return fence === null ? normalizeInlineMarkdown(line) : line;
+		})
+		.join("\n");
+}
+
+const ERROR_TITLE = /^(?:404\b|page not found\b|not found\b)/i;
+
+function firstMarkdownHeading(content: string): string {
+	let fence: { char: string; length: number } | null = null;
+	for (const line of content.split("\n")) {
+		const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+		if (fenceMatch) {
+			const marker = fenceMatch[1]!;
+			if (fence === null) {
+				fence = { char: marker[0]!, length: marker.length };
+			} else if (
+				marker[0] === fence.char &&
+				marker.length >= fence.length &&
+				line.slice(fenceMatch[0].length).trim() === ""
+			) {
+				fence = null;
+			}
+			continue;
+		}
+		if (fence !== null) continue;
+		const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+		if (heading) return heading[1]!.trim();
+	}
+	return "";
+}
+
+// A site-level 404 can still return 200 + a short navigation shell. Do not reject
+// short pages generally: some valid pages are shorter than MIN_USEFUL_CONTENT.
+// A title alone is not enough: "404 Not Found - HTTP" can be a real article.
+function isUnusableDeepSeekPage(title: string, content: string): boolean {
+	// Long pages are real content even if their title or first heading happens to be an error term.
+	if (content.length >= 500) return false;
+	const heading = firstMarkdownHeading(content);
+	if (heading !== "" && ERROR_TITLE.test(heading)) return true;
+	return ERROR_TITLE.test(text(title)) && /\b(?:404|page not found|not found)\b/i.test(content.slice(0, 200));
+}
+
 function parseResponse(value: unknown): DeepSeekResult[] {
 	const results = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).results : undefined;
 	if (!Array.isArray(results)) throw new Error("DeepSeek returned invalid response: expected a results array");
@@ -126,7 +212,7 @@ export function isDeepSeekAvailable(): boolean {
 	return hasCredentialSource({ provider: "DeepSeek", configuredValue: loadConfig().deepseekApiKey, environmentValue: process.env.DEEPSEEK_API_KEY });
 }
 
-export async function searchWithDeepSeek(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
+export async function searchWithDeepSeek(query: string, options: DeepSeekSearchOptions = {}): Promise<SearchResponse> {
 	const builtQuery = buildQuery(query, options);
 	const apiKey = await requireApiKey(options.signal);
 	const numResults = normalizeSearchResultCount(options.numResults);
@@ -142,7 +228,7 @@ export async function searchWithDeepSeek(query: string, options: SearchOptions =
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${apiKey}`,
 			},
-			body: JSON.stringify({ query: builtQuery, count: numResults }),
+			body: JSON.stringify({ query: builtQuery, count: numResults, ...(options.includeContent ? { need_content: true } : {}) }),
 			signal: options.signal ? AbortSignal.any([timeoutSignal, options.signal]) : timeoutSignal,
 		}, ["Authorization"]);
 		if (!response.ok) {
@@ -178,6 +264,7 @@ export async function searchWithDeepSeek(query: string, options: SearchOptions =
 	}
 	activityMonitor.logComplete(activityId, response.status);
 	const results: SearchResponse["results"] = [];
+	const inlineContent: ExtractedContent[] = [];
 	const seen = new Set<string>();
 	for (const entry of entries) {
 		if (!entry || typeof entry !== "object") continue;
@@ -191,14 +278,99 @@ export async function searchWithDeepSeek(query: string, options: SearchOptions =
 		if (resultUrl.protocol !== "http:" && resultUrl.protocol !== "https:") continue;
 		if (seen.has(resultUrl.href)) continue;
 		seen.add(resultUrl.href);
+		const title = text(entry.title) || `Source ${results.length + 1}`;
 		results.push({
-			title: text(entry.title) || `Source ${results.length + 1}`,
+			title,
 			url: resultUrl.href,
 			snippet: (text(entry.summary) || text(entry.snippet)).slice(0, MAX_SNIPPET_CHARS),
 		});
+		if (options.includeContent) {
+			// Search content is not pre-escaped (unlike Fetch), so its backslashes are real text.
+			const content = typeof entry.content === "string" ? entry.content.trim() : "";
+			if (content) inlineContent.push({ url: resultUrl.href, title, content, error: null });
+		}
 		if (results.length >= numResults) break;
 	}
 	// A non-empty page with no usable entry is a broken response, not "no results", so routing can fall back.
 	if (entries.length > 0 && results.length === 0) throw new Error("DeepSeek returned invalid response: no result had an http(s) URL");
-	return { answer: formatSearchResultsAsAnswer(results), results };
+	const searchResponse: SearchResponse = { answer: formatSearchResultsAsAnswer(results), results };
+	if (inlineContent.length > 0) searchResponse.inlineContent = inlineContent;
+	return searchResponse;
+}
+
+/**
+ * Fetch a single page through DeepSeek's Fetch API, which returns page content
+ * already converted to Markdown. Opt-in via `fetchRouting.providers`.
+ */
+export async function extractWithDeepSeek(
+	url: string,
+	signal?: AbortSignal,
+	options: ExtractOptions = {},
+): Promise<ExtractedContent | null> {
+	const apiKey = await requireApiKey(signal);
+	const activityId = activityMonitor.logStart({ type: "fetch", url });
+	const timeoutMs = options.timeoutMs ?? FETCH_TIMEOUT_MS;
+	const timeoutSignal = AbortSignal.timeout(timeoutMs);
+	try {
+		const ssrf = loadSsrfConfig();
+		await validateRemoteUrl(url, {
+			allowRanges: ssrf.allowRanges,
+			trustEnvProxy: ssrf.trustEnvProxy,
+			domainPolicy: loadFetchContentDomainPolicy(),
+			...(options.lookup ? { lookup: options.lookup } : {}),
+		});
+		const response = await fetchWithCredentialRedirects(DEEPSEEK_FETCH_URL, {
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${apiKey}`,
+			},
+			body: JSON.stringify({ url }),
+			signal: signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal,
+		}, ["Authorization"]);
+		if (!response.ok) {
+			const errorText = redactCredential(describeError(await response.text()), apiKey).slice(0, 300);
+			throw new Error(`DeepSeek Fetch error ${response.status}: ${errorText}`);
+		}
+		let rawData: unknown;
+		try {
+			rawData = await response.json();
+		} catch (err) {
+			if (err instanceof Error && err.name === "TimeoutError") throw err;
+			throw new Error(`DeepSeek Fetch returned invalid JSON: ${errorMessage(err)}`);
+		}
+		if (!rawData || typeof rawData !== "object" || Array.isArray(rawData)) {
+			throw new Error("DeepSeek Fetch returned an unexpected response shape");
+		}
+		const page = rawData as { title?: unknown; content?: unknown };
+		const title = typeof page.title === "string" ? page.title.trim() : "";
+		const content = typeof page.content === "string" ? normalizeDeepSeekMarkdown(page.content).trim() : "";
+		if (!content || isUnusableDeepSeekPage(title, content)) {
+			activityMonitor.logComplete(activityId, response.status);
+			return null;
+		}
+		activityMonitor.logComplete(activityId, response.status);
+		return {
+			url,
+			title,
+			content,
+			error: null,
+		};
+	} catch (err) {
+		const message = errorMessage(err);
+		if (signal?.aborted) {
+			activityMonitor.logComplete(activityId, 0);
+			throw new Error("Aborted");
+		}
+		activityMonitor.logError(activityId, redactCredential(message, apiKey));
+		if (err instanceof Error && err.name === "TimeoutError") {
+			throw new Error(`DeepSeek Fetch request timed out after ${Math.round(timeoutMs / 1000)}s`);
+		}
+		const redactedMessage = redactCredential(message, apiKey);
+		if (redactedMessage === message) throw err;
+		const redactedError = new Error(redactedMessage);
+		if (err instanceof Error) redactedError.name = err.name;
+		throw redactedError;
+	}
 }
