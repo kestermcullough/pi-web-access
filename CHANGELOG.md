@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Optional Linkup search provider. Set `linkupApiKey` or `LINKUP_API_KEY` and select `provider: "linkup"`. Configure `linkupDepth` as `flash`, `fast` (default), `standard`, or `deep`. Supports result limits, domain filters, recency filters, and inline text content. Linkup is excluded from the built-in `auto` chain and `all` because searches consume account credits.
+- Optional Linkup search provider. Set `linkupApiKey` or `LINKUP_API_KEY` and select `provider: "linkup"`. Configure `linkupDepth` as `flash`, `fast` (default), `standard`, or `deep`. Supports result limits, domain filters, recency filters, and inline text content. Linkup is excluded from the built-in `auto` chain and `all` because searches consume account credits. Thanks to [@kestermcullough](https://github.com/kestermcullough) for [PR #584](https://github.com/nicobailon/pi-web-access/pull/584).
 
 ## [0.42.0] - 2026-10-17
 
