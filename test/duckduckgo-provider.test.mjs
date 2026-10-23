@@ -182,3 +182,28 @@ test("DuckDuckGo skips the network after a bot check so routing falls through at
 	assert.equal(output.routed, "tavily");
 	assert.deepEqual(output.calls, ["html.duckduckgo.com", "api.tavily.com"]);
 });
+
+test("DuckDuckGo timeout falls through configured network routing instead of counting as an abort", async () => {
+	const home = await createConfig({
+		searchRouting: { providers: ["duckduckgo", "tavily"], fallbackOn: ["network"] },
+	});
+	const child = runChild(`
+		globalThis.fetch = async (url, init) => {
+			if (String(url) === "https://api.tavily.com/search") return new Response(JSON.stringify({ answer: "fallback", results: [] }), { status: 200 });
+			return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+		};
+		const { searchWithDuckDuckGo, resetDuckDuckGoRateLimit } = await import(${JSON.stringify(duckDuckGoModuleUrl)});
+		resetDuckDuckGoRateLimit({ minIntervalMs: 0, timeoutMs: 50 });
+		const keepAlive = setTimeout(() => {}, 5000); // AbortSignal.timeout alone does not keep Node running
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		let direct = "";
+		try { await searchWithDuckDuckGo("slow"); } catch (error) { direct = String(error); }
+		const routed = await search("slow", { provider: "auto" });
+		console.log(JSON.stringify({ direct, routed: routed.provider }));
+		clearTimeout(keepAlive);
+	`, { PI_CODING_AGENT_DIR: home, TAVILY_API_KEY: "tavily-test-key" });
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.match(output.direct, /DuckDuckGo request timed out after 1s/);
+	assert.equal(output.routed, "tavily");
+});

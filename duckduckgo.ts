@@ -5,8 +5,6 @@ import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.t
 import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 
 const SEARCH_URL = "https://html.duckduckgo.com/html/";
-const SEARCH_TIMEOUT_MS = 30_000;
-
 let rateLimit = new DuckDuckGoRateLimit();
 
 /** Replace the shared request spacing and bot-check cooldown state (for tests). */
@@ -62,16 +60,14 @@ export async function searchWithDuckDuckGo(query: string, options: SearchOptions
 	const activityId = activityMonitor.logStart({ type: "api", query });
 
 	try {
-		return await rateLimit.run(async () => {
+		return await rateLimit.run(async signal => {
 			const response = await fetch(url, {
 				method: "GET",
 				headers: {
 					Accept: "text/html",
 					"User-Agent": "Mozilla/5.0 (compatible; pi-web-access/1.0; +https://github.com/nicobailon/pi-web-access)",
 				},
-				signal: options.signal
-					? AbortSignal.any([AbortSignal.timeout(SEARCH_TIMEOUT_MS), options.signal])
-					: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+				signal,
 			});
 			if (!response.ok) {
 				const body = await response.text();

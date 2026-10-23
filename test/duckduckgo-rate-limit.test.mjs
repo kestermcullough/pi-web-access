@@ -81,3 +81,32 @@ test("DuckDuckGo queued requests can be aborted without running", async () => {
 	await assert.rejects(gate.run(async () => { calls++; }, AbortSignal.abort()), /Aborted/);
 	assert.equal(calls, 1);
 });
+
+test("DuckDuckGo deadline counts time spent queued and reports a timeout, not an abort", async () => {
+	// AbortSignal.timeout does not keep Node running; a real request's socket would.
+	const keepAlive = setTimeout(() => {}, 5000);
+	const gate = new DuckDuckGoRateLimit({ minIntervalMs: 0, timeoutMs: 100 });
+	const started = Date.now();
+	let secondRan = false;
+	// The first request ignores its signal and holds the queue for 300ms.
+	const first = gate.run(() => new Promise(resolve => setTimeout(resolve, 300)));
+	const second = gate.run(async () => { secondRan = true; });
+	const firstRejected = assert.rejects(first, /DuckDuckGo request timed out after 1s/);
+	await assert.rejects(second, /DuckDuckGo request timed out after 1s/);
+	assert.ok(Date.now() - started < 250, "the queued search gave up at its own deadline instead of waiting for the first");
+	await firstRejected;
+	await new Promise(resolve => setTimeout(resolve, 350));
+	assert.equal(secondRan, false, "a search whose deadline passed in the queue never runs");
+	clearTimeout(keepAlive);
+});
+
+test("DuckDuckGo caller aborts still report an abort", async () => {
+	const gate = new DuckDuckGoRateLimit({ minIntervalMs: 0, timeoutMs: 10_000 });
+	const controller = new AbortController();
+	const pending = gate.run(signal => new Promise((_, reject) => {
+		signal.addEventListener("abort", () => reject(new Error("This operation was aborted")), { once: true });
+	}), controller.signal);
+	controller.abort();
+	await assert.rejects(pending, /abort/i);
+	await assert.rejects(pending, error => !/timed out/.test(error.message));
+});
