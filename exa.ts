@@ -357,18 +357,23 @@ function parseMcpResults(text: string): McpParsedResult[] | null {
 		const title = block.match(/^Title: (.+)/m)?.[1]?.trim() ?? "";
 		const url = block.match(/^URL: (.+)/m)?.[1]?.trim() ?? "";
 		let content = "";
+		let contentStart = block.length;
 		const textStart = block.indexOf("\nText: ");
 		if (textStart >= 0) {
 			content = block.slice(textStart + 7).trim();
+			contentStart = textStart;
 		} else {
 			const hlMatch = block.match(/\nHighlights:\s*\n/);
 			if (hlMatch?.index != null) {
 				content = block.slice(hlMatch.index + hlMatch[0].length).trim();
+				contentStart = hlMatch.index;
 			}
 		}
 		content = content.replace(/\n---\s*$/, "").trim();
-		const publishedDate = block.match(/^Published: (.+)/m)?.[1]?.trim();
-		const author = block.match(/^Author: (.+)/m)?.[1]?.trim();
+		// Read metadata from the header only, so a quoted "Author:" line in the page text is not taken as the source's.
+		const header = block.slice(0, contentStart);
+		const publishedDate = header.match(/^Published: (.+)/m)?.[1]?.trim();
+		const author = header.match(/^Author: (.+)/m)?.[1]?.trim();
 		return { title, url, content, publishedDate, author };
 	}).filter(result => result.url.length > 0);
 	return parsed.length > 0 ? parsed : null;

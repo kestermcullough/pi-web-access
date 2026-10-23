@@ -82,11 +82,13 @@ test("keyless Exa MCP text results list the published date and authors and skip 
 	const text = [
 		"Title: Paper A\nURL: https://doi.org/10.1/a\nPublished: 2015-01-01T00:00:00.000Z\nAuthor: A. One, B. Two, C. Three, D. Four\nHighlights:\nFirst highlight.",
 		"Title: Page B\nURL: https://example.com/b\nPublished: N/A\nAuthor: N/A\nHighlights:\nSecond highlight.",
+		"Title: Page C\nURL: https://example.com/c\nText: An article quoting a paper.\nAuthor: Quoted Person\nPublished: 1999-01-01",
 	].join("\n\n---\n\n");
 	const body = `data: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text }] } })}\n\n`;
 	const result = await searchWith(body, { keyed: false });
 	assert.equal(result.answer, [
 		"First highlight.\nSource: Paper A (https://doi.org/10.1/a)\nPublished: 2015-01-01 | Authors: A. One, B. Two, C. Three et al.",
 		"Second highlight.\nSource: Page B (https://example.com/b)",
+		"An article quoting a paper. Author: Quoted Person Published: 1999-01-01\nSource: Page C (https://example.com/c)",
 	].join("\n\n"));
 });
